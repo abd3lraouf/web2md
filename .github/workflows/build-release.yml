@@ -22,12 +22,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: src/package-lock.json
 
       - name: Install dependencies
         working-directory: src
-        run: npm ci
+        run: npm install
 
       - name: Run unit tests
         working-directory: src
@@ -52,12 +50,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: src/package-lock.json
 
       - name: Install dependencies
         working-directory: src
-        run: npm ci
+        run: npm install
 
       - name: Get version from manifest
         id: get-version
