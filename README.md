@@ -1,3 +1,5 @@
+THis is now merged to the main repo
+
 # MarkSnip - Markdown Web Clipper
 
 ## [MarkSnip Chrome Extension Link](https://chromewebstore.google.com/detail/marksnip-markdown-web-cli/kcbaglhfgbkjdnpeokaamjjkddempipm?hl=en)
