@@ -404,7 +404,8 @@ if (!window.linkPickerMessageListenerAdded) {
     window.linkPickerMessageListenerAdded = true;
 }
 
-const ACCENT_COLORS = {
+// Use var to allow redeclaration if the content script is injected multiple times.
+var ACCENT_COLORS = {
     sage:  { dark: '#56735A', darker: '#3F5441', base: '#6B8E6F' },
     ocean: { dark: '#4A7A92', darker: '#385D6F', base: '#5B8FA8' },
     slate: { dark: '#56657A', darker: '#414D5C', base: '#6B7B8E' },
