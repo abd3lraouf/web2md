@@ -2,6 +2,7 @@ importScripts(
   'browser-polyfill.min.js',
   'background/moment.min.js',
   'background/apache-mime-types.js',
+  'background/download-registry.js',
   'shared/default-options.js',
   'shared/context-menus.js'
 );
@@ -22,14 +23,12 @@ browser.storage.onChanged.addListener(handleStorageChange);
 // Create context menus when service worker starts
 createMenus();
 
-// Track active downloads
-const activeDownloads = new Map();
 let batchConversionInProgress = false;
 
-// Track MarkSnip downloads to handle filename conflicts
-const markSnipDownloads = new Map(); // downloadId -> { filename, imageList }
-const markSnipUrls = new Map(); // url -> { filename, expectedFilename }
-const markSnipBlobUrls = new Set(); // Track blob URLs we've created for positive identification
+// Tracks MarkSnip-initiated downloads so onDeterminingFilename can claim
+// them without interfering with other extensions' downloads. See
+// background/download-registry.js for the contract.
+const registry = new DownloadRegistry();
 
 // Add listener to handle filename conflicts from other extensions
 browser.downloads.onDeterminingFilename.addListener(handleFilenameConflict);
@@ -43,55 +42,14 @@ browser.downloads.onDeterminingFilename.addListener(handleFilenameConflict);
  * Calling suggest() for untracked downloads causes conflicts with other extensions.
  */
 function handleFilenameConflict(downloadItem, suggest) {
-  console.log(`onDeterminingFilename called for download ${downloadItem.id}`, downloadItem);
-  console.log(`Current markSnipDownloads:`, Array.from(markSnipDownloads.keys()));
-  console.log(`Current markSnipUrls:`, Array.from(markSnipUrls.keys()));
-  console.log(`Current markSnipBlobUrls:`, Array.from(markSnipBlobUrls));
-
-  // Check tracking methods in order of reliability:
-  // 1. Already tracked by download ID (most reliable)
-  // 2. Pre-tracked by URL in markSnipUrls (reliable if set before download)
-  // 3. Is a blob URL we created (tracked in markSnipBlobUrls)
-  const trackedById = markSnipDownloads.has(downloadItem.id);
-  const trackedByUrl = downloadItem.url && markSnipUrls.has(downloadItem.url);
-  const isOurBlobUrl = downloadItem.url && markSnipBlobUrls.has(downloadItem.url);
-
-  // Only handle downloads we positively identify as ours
-  // We do NOT handle arbitrary blob URLs to avoid conflicts with other extensions
-  if (trackedById || trackedByUrl || isOurBlobUrl) {
-    let filename = null;
-    
-    if (trackedById) {
-      const downloadInfo = markSnipDownloads.get(downloadItem.id);
-      filename = downloadInfo?.filename;
-    } else if (trackedByUrl) {
-      const urlInfo = markSnipUrls.get(downloadItem.url);
-      filename = urlInfo?.filename;
-    } else if (isOurBlobUrl && trackedByUrl === false) {
-      // Blob URL we created but not in markSnipUrls - try to get from markSnipUrls as fallback
-      const urlInfo = markSnipUrls.get(downloadItem.url);
-      filename = urlInfo?.filename;
-    }
-
-    if (filename) {
-      console.log(`✅ Suggesting correct filename for MarkSnip download ${downloadItem.id}: ${filename}`);
-      suggest({
-        filename: filename,
-        conflictAction: 'uniquify'
-      });
-      return true; // Indicate we handled this asynchronously
-    }
-    
-    // We identified it as our download but couldn't get the filename
-    // This shouldn't happen, but if it does, don't interfere
-    console.warn(`⚠️ MarkSnip download ${downloadItem.id} identified but no filename found`);
+  const filename = registry.claim(downloadItem);
+  if (filename) {
+    suggest({ filename, conflictAction: 'uniquify' });
+    return true;
   }
-
-  // NOT our download - DO NOT call suggest()
-  // Let Chrome use the original filename from download() call
-  // This prevents conflicts with other extensions
-  console.log(`⏭️ Not a MarkSnip download ${downloadItem.id}, not interfering`);
-  return false; // Indicate we're not handling this
+  // NOT our download — do NOT call suggest(). Letting Chrome use the
+  // original filename prevents conflicts with other extensions.
+  return false;
 }
 
 /**
@@ -112,18 +70,11 @@ async function handleMessages(message, sender, sendResponse) {
       await handleImageDownloadsContentScript(message);
       break;
     case "track-download-url":
-      // Track URL before download starts (from offscreen)
-      console.log(`📝 Tracking URL before download: ${message.url} -> ${message.filename}`);
-      markSnipUrls.set(message.url, {
+      registry.trackUrl(message.url, {
         filename: message.filename,
         isMarkdown: message.isMarkdown || false,
         isImage: message.isImage || false
       });
-      // Also track as our blob URL if it's a blob URL
-      if (message.url && message.url.startsWith('blob:')) {
-        markSnipBlobUrls.add(message.url);
-        console.log(`📝 Added blob URL to tracking set: ${message.url}`);
-      }
       break;
     case "offscreen-ready":
       // The offscreen document is ready - no action needed
@@ -617,30 +568,23 @@ async function handleImageDownloads(message) {
         
         const fullImagePath = adjustedDestPath ? adjustedDestPath + filename : filename;
         
-        // If this is a blob URL (pre-processed image), track it by URL
+        // If this is a blob URL (pre-processed image), pre-track by URL
+        // so onDeterminingFilename can claim it before download() resolves.
         if (src.startsWith('blob:')) {
-          markSnipUrls.set(src, {
-            filename: fullImagePath,
-            isImage: true
-          });
+          registry.trackUrl(src, { filename: fullImagePath, isImage: true });
         }
-        
+
         const imgId = await browser.downloads.download({
           url: src,
           filename: fullImagePath,
           saveAs: false
         });
 
-        // Track the download
-        activeDownloads.set(imgId, src);
-        
-        // For non-blob URLs, track by ID since we can't pre-track by URL
-        if (!src.startsWith('blob:')) {
-          markSnipDownloads.set(imgId, { 
-            filename: fullImagePath,
-            isImage: true,
-            url: src
-          });
+        if (src.startsWith('blob:')) {
+          registry.promoteUrlToId(src, imgId);
+        } else {
+          // External URL — can't pre-track; track by ID after the fact.
+          registry.trackId(imgId, { filename: fullImagePath, isImage: true, url: src });
         }
         
         console.log('✅ Image download started:', imgId, filename);
@@ -862,12 +806,10 @@ async function handleDownloadRequest(message) {
  * Download listener function factory
  */
 function downloadListener(id, url) {
-  activeDownloads.set(id, url);
   return function handleChange(delta) {
     if (delta.id === id && delta.state && delta.state.current === "complete") {
       // Only revoke blob URLs that we control (created in offscreen)
-      if (url.startsWith('blob:chrome-extension://')) {
-        // Send message to offscreen to clean up the blob URL
+      if (url && url.startsWith('blob:chrome-extension://')) {
         browser.runtime.sendMessage({
           type: 'cleanup-blob-url',
           url: url
@@ -875,9 +817,7 @@ function downloadListener(id, url) {
           console.log('⚠️ Could not cleanup blob URL (offscreen may be closed):', err.message);
         });
       }
-      activeDownloads.delete(id);
-      markSnipDownloads.delete(id); // Clean up filename tracking
-      markSnipBlobUrls.delete(url); // Clean up blob URL tracking
+      registry.release(id);
     }
   };
 }
@@ -886,63 +826,26 @@ function downloadListener(id, url) {
  * Enhanced download listener to handle image downloads
  */
 function handleDownloadChange(delta) {
-  if (activeDownloads.has(delta.id)) {
-    if (delta.state && delta.state.current === "complete") {
-      console.log('✅ Download completed:', delta.id);
-      const url = activeDownloads.get(delta.id);
-      
-      // Only revoke blob URLs that we control (created in offscreen)
-      if (url.startsWith('blob:chrome-extension://')) {
-        // Send message to offscreen to clean up the blob URL
-        browser.runtime.sendMessage({
-          type: 'cleanup-blob-url',
-          url: url
-        }).catch(err => {
-          console.log('⚠️ Could not cleanup blob URL (offscreen may be closed):', err.message);
-        });
-      }
-      
-      activeDownloads.delete(delta.id);
-      markSnipDownloads.delete(delta.id); // Clean up filename tracking
-      markSnipBlobUrls.delete(url); // Clean up blob URL tracking
+  if (!registry.isActive(delta.id)) return;
+  const state = delta.state && delta.state.current;
+  if (state !== 'complete' && state !== 'interrupted') return;
 
-      // Also clean up markSnipUrls by URL if still present
-      if (url && markSnipUrls.has(url)) {
-        markSnipUrls.delete(url);
-      }
-    } else if (delta.state && delta.state.current === "interrupted") {
-      console.error('❌ Download interrupted:', delta.id, delta.error);
-      const url = activeDownloads.get(delta.id);
-      
-      // Only revoke blob URLs that we control
-      if (url.startsWith('blob:chrome-extension://')) {
-        // Send message to offscreen to clean up the blob URL
-        browser.runtime.sendMessage({
-          type: 'cleanup-blob-url',
-          url: url
-        }).catch(err => {
-          console.log('⚠️ Could not cleanup blob URL (offscreen may be closed):', err.message);
-        });
-      }
-      
-      activeDownloads.delete(delta.id);
-      markSnipDownloads.delete(delta.id); // Clean up filename tracking
-      markSnipBlobUrls.delete(url); // Clean up blob URL tracking
-
-      // Also clean up markSnipUrls by URL if still present
-      if (url && markSnipUrls.has(url)) {
-        markSnipUrls.delete(url);
-      }
-    }
+  if (state === 'complete') {
+    console.log('✅ Download completed:', delta.id);
+  } else {
+    console.error('❌ Download interrupted:', delta.id, delta.error);
   }
 
-  // Also clean up any remaining URL tracking
-  if (markSnipDownloads.has(delta.id)) {
-    const downloadInfo = markSnipDownloads.get(delta.id);
-    if (downloadInfo.url && markSnipUrls.has(downloadInfo.url)) {
-      markSnipUrls.delete(downloadInfo.url);
-    }
+  const url = registry.getUrl(delta.id);
+  if (url && url.startsWith('blob:chrome-extension://')) {
+    browser.runtime.sendMessage({
+      type: 'cleanup-blob-url',
+      url
+    }).catch(err => {
+      console.log('⚠️ Could not cleanup blob URL (offscreen may be closed):', err.message);
+    });
   }
+  registry.release(delta.id);
 }
 
 /**
@@ -951,7 +854,9 @@ function handleDownloadChange(delta) {
 function handleDownloadComplete(message) {
   const { downloadId, url } = message;
   if (downloadId && url) {
-    activeDownloads.set(downloadId, url);
+    // Offscreen-initiated download lacks filename context here; track by
+    // ID so cleanup in handleDownloadChange can find the URL.
+    registry.trackId(downloadId, { url });
   }
 }
 
@@ -1822,40 +1727,19 @@ async function handleDownloadWithBlobUrl(blobUrl, filename, tabId, imageList = {
     const downloadsAPI = browser.downloads || chrome.downloads;
     
     try {
-      // CRITICAL: Set up URL tracking BEFORE calling download API
-      // Track in both Maps for redundancy
-      markSnipUrls.set(blobUrl, {
-        filename: filename,
-        isMarkdown: true
-      });
-      markSnipBlobUrls.add(blobUrl);
-      console.log(`📝 [Service Worker] Pre-tracked blob URL: ${blobUrl} -> ${filename}`);
-      
-      // Start download using pre-made blob URL
+      // CRITICAL: pre-track the URL BEFORE calling download() so that
+      // onDeterminingFilename can claim the download even if it fires
+      // before download() resolves.
+      registry.trackUrl(blobUrl, { filename, isMarkdown: true });
+
       const id = await downloadsAPI.download({
         url: blobUrl,
         filename: filename,
-        saveAs: false  // EXPLICITLY set to false to avoid save dialog
+        saveAs: false  // EXPLICITLY false to avoid save dialog
       });
-      
-      console.log(`✅ [Service Worker] Download started with ID: ${id} for file: ${filename} (saveAs: false)`);
-      console.log(`🔧 [Service Worker] Download options used:`, { 
-        url: blobUrl.substring(0, 50) + '...', 
-        filename: filename, 
-        saveAs: false 
-      });
-      
-      // Move from URL tracking to ID tracking
-      if (markSnipUrls.has(blobUrl)) {
-        const urlInfo = markSnipUrls.get(blobUrl);
-        markSnipDownloads.set(id, {
-          ...urlInfo,
-          url: blobUrl
-        });
-        markSnipUrls.delete(blobUrl);
-      }
-      
-      // Add download listener for cleanup
+      console.log(`✅ [Service Worker] Download started with ID: ${id} for file: ${filename}`);
+
+      registry.promoteUrlToId(blobUrl, id);
       browser.downloads.onChanged.addListener(downloadListener(id, blobUrl));
       
       // Handle images if needed
@@ -1916,16 +1800,8 @@ async function handleDownloadDirectly(markdown, title, tabId, imageList = {}, md
       
       console.log(`🎯 [Service Worker] Starting Downloads API: URL=${url}, filename="${fullFilename}"`);
       
-      // CRITICAL: Set up URL tracking BEFORE calling download API
-      // Track in both Maps for redundancy
-      markSnipUrls.set(url, {
-        filename: fullFilename,
-        isMarkdown: true
-      });
-      markSnipBlobUrls.add(url);
-      console.log(`📝 [Service Worker] Pre-tracked blob URL: ${url} -> ${fullFilename}`);
-      
-      // Start download
+      registry.trackUrl(url, { filename: fullFilename, isMarkdown: true });
+
       const id = await downloadsAPI.download({
         url: url,
         filename: fullFilename,
@@ -1934,17 +1810,7 @@ async function handleDownloadDirectly(markdown, title, tabId, imageList = {}, md
       
       console.log(`✅ [Service Worker] Download started with ID: ${id}`);
       
-      // Move from URL tracking to ID tracking
-      if (markSnipUrls.has(url)) {
-        const urlInfo = markSnipUrls.get(url);
-        markSnipDownloads.set(id, {
-          ...urlInfo,
-          url: url
-        });
-        markSnipUrls.delete(url);
-      }
-      
-      // Add download listener for cleanup
+      registry.promoteUrlToId(url, id);
       browser.downloads.onChanged.addListener(downloadListener(id, url));
       
       // Handle images if needed
@@ -2043,16 +1909,8 @@ async function downloadMarkdown(markdown, title, tabId, imageList = {}, mdClipsF
       
       console.log(`🚀 [Service Worker] Starting Downloads API download: URL=${url}, filename="${fullFilename}"`);
       
-      // CRITICAL: Set up URL tracking BEFORE calling download API
-      // Track in both Maps for redundancy
-      markSnipUrls.set(url, {
-        filename: fullFilename,
-        isMarkdown: true
-      });
-      markSnipBlobUrls.add(url);
-      console.log(`📝 [Service Worker] Pre-tracked blob URL: ${url} -> ${fullFilename}`);
-      
-      // Start download
+      registry.trackUrl(url, { filename: fullFilename, isMarkdown: true });
+
       const id = await downloadsAPI.download({
         url: url,
         filename: fullFilename,
@@ -2061,17 +1919,7 @@ async function downloadMarkdown(markdown, title, tabId, imageList = {}, mdClipsF
       
       console.log(`✅ [Service Worker] Downloads API download started with ID: ${id}`);
       
-      // Move from URL tracking to ID tracking
-      if (markSnipUrls.has(url)) {
-        const urlInfo = markSnipUrls.get(url);
-        markSnipDownloads.set(id, {
-          ...urlInfo,
-          url: url
-        });
-        markSnipUrls.delete(url);
-      }
-      
-      // Add download listener for cleanup
+      registry.promoteUrlToId(url, id);
       browser.downloads.onChanged.addListener(downloadListener(id, url));
       
       // Handle images if needed
@@ -2131,13 +1979,7 @@ async function handleImageDownloadsDirectly(imageList, mdClipsFolder, title, opt
         saveAs: false
       });
       
-      console.log(`📝 Tracking image download ${imgId} with filename: ${fullImagePath}`);
-      markSnipDownloads.set(imgId, { 
-        filename: fullImagePath,
-        isImage: true,
-        url: src
-      });
-      
+      registry.trackId(imgId, { filename: fullImagePath, isImage: true, url: src });
       browser.downloads.onChanged.addListener(downloadListener(imgId, src));
       
     } catch (imgErr) {
