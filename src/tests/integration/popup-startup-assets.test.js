@@ -2,8 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const { JSDOM } = require('jsdom');
 
-describe('Popup startup assets', () => {
-  test('popup HTML no longer eagerly loads all CodeMirror theme styles or the notification host', () => {
+describe('Popup startup assets (lite)', () => {
+  test('popup HTML loads only essential scripts and stylesheets', () => {
     const popupHtml = fs.readFileSync(
       path.join(__dirname, '../../popup/popup.html'),
       'utf8'
@@ -16,46 +16,63 @@ describe('Popup startup assets', () => {
     const stylesheetHrefs = Array.from(document.querySelectorAll('link[rel="stylesheet"]'))
       .map((link) => link.getAttribute('href'));
 
-    expect(stylesheetHrefs).toContain('lib/codemirror.css');
-    expect(stylesheetHrefs).not.toContain('lib/xq-dark.css');
-    expect(stylesheetHrefs).not.toContain('lib/xq-light.css');
-    expect(stylesheetHrefs).not.toContain('lib/dracula.css');
-    expect(stylesheetHrefs).not.toContain('lib/material.css');
-    expect(stylesheetHrefs).not.toContain('lib/material-darker.css');
-    expect(stylesheetHrefs).not.toContain('lib/monokai.css');
-    expect(stylesheetHrefs).not.toContain('lib/nord.css');
-    expect(stylesheetHrefs).not.toContain('lib/solarized.css');
-    expect(stylesheetHrefs).not.toContain('lib/twilight.css');
-
-    // marked must not be eagerly loaded — it is lazy-loaded on first Preview toggle
-    expect(stylesheetHrefs).not.toContain('lib/github-markdown.css');
+    expect(stylesheetHrefs).toContain('popup.css');
+    // CodeMirror and theme stylesheets must not be loaded
+    expect(stylesheetHrefs).not.toContain('lib/codemirror.css');
+    expect(stylesheetHrefs).not.toContain('lib/marked.min.js');
 
     const scriptHrefs = Array.from(document.querySelectorAll('script[src]'))
       .map((script) => script.getAttribute('src'));
 
     expect(scriptHrefs).toContain('popup.js');
+    expect(scriptHrefs).toContain('../browser-polyfill.min.js');
+    expect(scriptHrefs).toContain('../shared/default-options.js');
+
+    // Heavy dependencies that must NOT be loaded
+    expect(scriptHrefs).not.toContain('lib/codemirror.js');
     expect(scriptHrefs).not.toContain('../notifications/notification-host.js');
     expect(scriptHrefs).not.toContain('lib/marked.min.js');
+    expect(scriptHrefs).not.toContain('theme-bootstrap.js');
+  });
 
-    const splitButton = document.getElementById('splitBtnWrap');
-    expect(splitButton).not.toBeNull();
-    expect(document.getElementById('download')).not.toBeNull();
-    expect(document.getElementById('splitArrow')).not.toBeNull();
-    expect(document.getElementById('splitDropdown')).not.toBeNull();
-    expect(document.getElementById('elementPickerRow')).not.toBeNull();
-    expect(document.getElementById('pickElement')).not.toBeNull();
-    expect(document.getElementById('ddSendToChatgpt')).not.toBeNull();
-    expect(document.getElementById('ddSendToClaude')).not.toBeNull();
-    expect(document.getElementById('ddSendToPerplexity')).not.toBeNull();
-    expect(document.querySelector('#ddSendToChatgpt .assistant-icon--chatgpt')).not.toBeNull();
-    expect(document.querySelector('#ddSendToClaude .assistant-icon--claude')).not.toBeNull();
-    expect(document.querySelector('#ddSendToPerplexity .assistant-icon--perplexity')).not.toBeNull();
-    expect(document.getElementById('ddSendToCustomTargets')).not.toBeNull();
-    expect(document.getElementById('ddMarkdown')).not.toBeNull();
-    expect(document.getElementById('ddText')).not.toBeNull();
-    expect(document.getElementById('ddHtml')).not.toBeNull();
-    expect(document.getElementById('ddPrint')).not.toBeNull();
-    expect(document.getElementById('ddPdf')).not.toBeNull();
-    expect(document.getElementById('splitDropdown').hasAttribute('hidden')).toBe(true);
+  test('popup has the essential lite UI elements', () => {
+    const popupHtml = fs.readFileSync(
+      path.join(__dirname, '../../popup/popup.html'),
+      'utf8'
+    );
+    const dom = new JSDOM(popupHtml);
+    const document = dom.window.document;
+
+    expect(document.getElementById('container')).not.toBeNull();
+    expect(document.getElementById('editor')).not.toBeNull();
+    expect(document.getElementById('copyBtn')).not.toBeNull();
+    expect(document.getElementById('sendChatgpt')).not.toBeNull();
+    expect(document.getElementById('sendClaude')).not.toBeNull();
+    expect(document.getElementById('sendPerplexity')).not.toBeNull();
+    expect(document.getElementById('themeToggle')).not.toBeNull();
+    expect(document.getElementById('titleInput')).not.toBeNull();
+    expect(document.getElementById('modeSelection')).not.toBeNull();
+    expect(document.getElementById('modeDocument')).not.toBeNull();
+    expect(document.getElementById('customTargets')).not.toBeNull();
+  });
+
+  test('popup does NOT have removed feature elements', () => {
+    const popupHtml = fs.readFileSync(
+      path.join(__dirname, '../../popup/popup.html'),
+      'utf8'
+    );
+    const dom = new JSDOM(popupHtml);
+    const document = dom.window.document;
+
+    // Download / Obsidian / Batch / Library / Reader / Highlighter removed
+    expect(document.getElementById('download')).toBeNull();
+    expect(document.getElementById('sendToObsidian')).toBeNull();
+    expect(document.getElementById('batchProcess')).toBeNull();
+    expect(document.getElementById('libraryViewToggle')).toBeNull();
+    expect(document.getElementById('toggleReader')).toBeNull();
+    expect(document.getElementById('toggleHighlighter')).toBeNull();
+    expect(document.getElementById('splitBtnWrap')).toBeNull();
+    expect(document.getElementById('pickElement')).toBeNull();
+    expect(document.getElementById('downloadImages')).toBeNull();
   });
 });

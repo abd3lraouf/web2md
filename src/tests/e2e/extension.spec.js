@@ -163,11 +163,13 @@ test.describe('MarkSnip Extension E2E', () => {
     try {
       await popupPage.goto(`chrome-extension://${extensionId}/popup/popup.html`);
       await expect(popupPage.locator('#container')).toBeVisible();
-      await expect(popupPage.locator('#pickElement')).toBeVisible();
 
-      const pickerBox = await popupPage.locator('#pickElement').boundingBox();
-      const bodyWidth = await popupPage.evaluate(() => document.body.getBoundingClientRect().width);
-      expect(pickerBox.x + pickerBox.width).toBeLessThanOrEqual(bodyWidth + 1);
+      // Lite popup essential elements
+      await expect(popupPage.locator('#editor')).toBeVisible();
+      await expect(popupPage.locator('#copyBtn')).toBeVisible();
+      await expect(popupPage.locator('#sendChatgpt')).toBeVisible();
+      await expect(popupPage.locator('#sendClaude')).toBeVisible();
+      await expect(popupPage.locator('#sendPerplexity')).toBeVisible();
     } finally {
       await popupPage.close().catch(() => {});
     }

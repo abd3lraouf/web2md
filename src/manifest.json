@@ -55,12 +55,6 @@
         "default": "Alt+Shift+M"
       }
     },
-    "download_tab_as_markdown": {
-      "suggested_key": {
-        "default": "Alt+Shift+D"
-      },
-      "description": "__MSG_cmdDownloadTab__"
-    },
     "copy_tab_as_markdown": {
       "suggested_key": {
         "default": "Alt+Shift+C"
@@ -75,18 +69,6 @@
         "default": "Alt+Shift+L"
       },
       "description": "__MSG_cmdCopyTabLink__"
-    },
-    "copy_selected_tab_as_markdown_link": {
-      "description": "__MSG_cmdCopySelectedTabLink__"
-    },
-    "copy_selection_to_obsidian": {
-      "description": "__MSG_cmdSendToObsidianSelection__"
-    },
-    "copy_tab_to_obsidian": {
-      "description": "__MSG_cmdSendToObsidianTab__"
-    },
-    "toggle_reader_view": {
-      "description": "__MSG_cmdToggleReader__"
     }
   },
   "web_accessible_resources": [
