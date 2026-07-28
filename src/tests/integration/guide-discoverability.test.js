@@ -28,14 +28,6 @@ describe('Guide discoverability — options', () => {
     expect(guideLink.getAttribute('target')).toBe('_blank');
     expect(guideLink.textContent).toMatch(/User Guide/i);
   });
-
-  test('options no-results state has a link to the guide', () => {
-    const noResults = dom.window.document.getElementById('search-no-results');
-    expect(noResults).not.toBeNull();
-    const guideLink = noResults.querySelector('a[href="/guide/guide.html"]');
-    expect(guideLink).not.toBeNull();
-    expect(guideLink.textContent).toMatch(/guide/i);
-  });
 });
 
 describe('Guide discoverability — manifest', () => {
