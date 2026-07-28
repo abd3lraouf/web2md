@@ -2,16 +2,17 @@
 /**
  * Local development orchestrator for the MarkSnip extension.
  *
- * One command -> rebuild .build/<browser>/ on every src/ change, then signal
- * web-ext to reload the extension. web-ext is told to watch only the sentinel
- * file (--watch-file) so reloads never fire mid-rebuild.
+ * Chrome:  uses Playwright's launchPersistentContext to load the unpacked
+ *          extension via --load-extension (the same mechanism our e2e tests
+ *          use). Reloads happen programmatically via chrome.runtime.reload().
  *
- *   npm run dev               # chrome, default
- *   npm run dev:chrome        # explicit
- *   npm run dev:firefox       # firefox (uses background.scripts[] manifest)
- *   node scripts/dev.js --browser=firefox --url=https://example.com --verbose
+ * Firefox: uses web-ext run (Mozilla's official tool), which works correctly
+ *          for Firefox. Reloads are triggered via the --watch-file sentinel.
  *
- * Any unknown --flag is forwarded to web-ext (e.g. --chromium-binary, --bc).
+ *   npm run dev               # chrome (default)
+ *   npm run dev:chrome
+ *   npm run dev:firefox
+ *   node scripts/dev.js --browser=firefox --url=https://example.com
  */
 
 const fs = require("fs");
@@ -23,9 +24,6 @@ const { buildBrowserManifests } = require("./generate-browser-manifests");
 const SRC_DIR = path.resolve(__dirname, "..");
 const BUILD_ROOT = path.join(SRC_DIR, ".build");
 
-// Anything under these top-level src/ entries should NOT trigger an extension
-// rebuild. tests/ and scripts/ don't ship in the extension; node_modules and
-// .build are obvious; web-ext-artifacts is output-only.
 const WATCH_IGNORED_TOP = new Set([
   "node_modules",
   ".build",
@@ -40,12 +38,15 @@ const WATCH_IGNORED_TOP = new Set([
 
 const DEBOUNCE_MS = 250;
 
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+
 function parseArgs(argv) {
-  const args = { browser: "chrome", url: null, verbose: false, forwarded: [] };
+  const args = { browser: "chrome", url: null, forwarded: [] };
   for (const token of argv.slice(2)) {
     if (token.startsWith("--browser=")) args.browser = token.slice(10);
     else if (token.startsWith("--url=")) args.url = token.slice(6);
-    else if (token === "--verbose") args.verbose = true;
     else if (token.startsWith("--no-")) args.forwarded.push(token);
     else if (token.startsWith("--")) {
       const [key, value] = token.slice(2).split("=");
@@ -67,25 +68,17 @@ function log(tag, message) {
 
 function rebuild(browser) {
   const before = Date.now();
-  // buildBrowserManifests rewrites BOTH chrome and firefox dirs. We only need
-  // the active one, but rebuilding both is cheap (~100ms) and keeps the other
-  // browser's build warm for a quick `npm run dev:firefox` switch.
   buildBrowserManifests({
     srcDir: SRC_DIR,
     buildRoot: BUILD_ROOT,
     logger: (line) => log("build  ", line.replace(SRC_DIR + "/", "")),
   });
-  const targetDir = path.join(BUILD_ROOT, browser);
-  const sentinel = path.join(targetDir, ".reload-trigger");
-  fs.writeFileSync(sentinel, String(Date.now()));
-  log("build  ", `${browser} rebuilt in ${Date.now() - before}ms (sentinel touched)`);
+  log("build  ", `${browser} rebuilt in ${Date.now() - before}ms`);
 }
 
 function watchSrc(onChange) {
   let timer = null;
-  // Recursive fs.watch is supported on macOS, Windows, and Linux (node >=19).
-  // We're on node 20 in CI and locally. Fall back is not needed.
-  const watcher = fs.watch(SRC_DIR, { recursive: true }, (event, filename) => {
+  const watcher = fs.watch(SRC_DIR, { recursive: true }, (_event, filename) => {
     if (!filename) return;
     const top = filename.split(path.sep)[0];
     if (WATCH_IGNORED_TOP.has(top)) return;
@@ -102,8 +95,52 @@ function watchSrc(onChange) {
   return watcher;
 }
 
-function spawnWebExt(browser, url, forwarded, verbose) {
-  const targetDir = path.join(BUILD_ROOT, browser);
+// ---------------------------------------------------------------------------
+// Chrome strategy: Playwright launchPersistentContext
+// ---------------------------------------------------------------------------
+
+async function launchChrome(targetDir, url) {
+  const { chromium } = require("@playwright/test");
+
+  const profileDir = path.join(BUILD_ROOT, ".dev-profile-chrome");
+  fs.mkdirSync(profileDir, { recursive: true });
+
+  const context = await chromium.launchPersistentContext(profileDir, {
+    headless: false,
+    args: [
+      `--disable-extensions-except=${targetDir}`,
+      `--load-extension=${targetDir}`,
+      "--window-size=1280,900",
+    ],
+  });
+
+  const page = context.pages()[0] || (await context.newPage());
+  await page.goto(url).catch(() => {});
+
+  // Wait for the service worker so we can confirm the extension loaded
+  let [sw] = context.serviceWorkers();
+  if (!sw) {
+    sw = await context.waitForEvent("serviceworker", { timeout: 15000 });
+  }
+  const extensionId = new URL(sw.url()).host;
+
+  return { context, page, extensionId };
+}
+
+async function reloadChrome(targetDir, url, prevContext) {
+  // chrome.runtime.reload() doesn't reliably restart the service worker in
+  // Playwright's persistent context with --load-extension. Full browser restart
+  // is ~3s but guarantees a clean reload. The persistent profile preserves
+  // extension storage, cookies, etc.
+  await prevContext.close().catch(() => {});
+  return launchChrome(targetDir, url);
+}
+
+// ---------------------------------------------------------------------------
+// Firefox strategy: web-ext (unchanged, works correctly for Firefox)
+// ---------------------------------------------------------------------------
+
+function startFirefox(targetDir, url, forwarded) {
   const sentinel = path.join(targetDir, ".reload-trigger");
   const webextBin = path.join(SRC_DIR, "node_modules", ".bin", "web-ext");
 
@@ -115,27 +152,36 @@ function spawnWebExt(browser, url, forwarded, verbose) {
     "--watch-file",
     sentinel,
     "--target",
-    browser === "firefox" ? "firefox-desktop" : "chromium",
+    "firefox-desktop",
     ...(url ? ["--start-url", url] : []),
     ...forwarded,
   ];
 
-  if (verbose) log("web-ext", `spawn: web-ext ${webExtArgs.join(" ")}`);
+  log("firefox", `spawning: web-ext ${webExtArgs.join(" ")}`);
 
   const child = spawn(webextBin, webExtArgs, {
     stdio: "inherit",
-    env: { ...process.env, WEB_EXT_TARGET: browser },
   });
 
   child.on("exit", (code) => {
-    log("web-ext", `exited with ${code}`);
+    log("firefox", `web-ext exited with ${code}`);
     process.exit(code ?? 0);
   });
 
-  return child;
+  // Firefox still needs the sentinel touched after each rebuild
+  return {
+    afterRebuild: () => {
+      fs.writeFileSync(sentinel, String(Date.now()));
+    },
+    child,
+  };
 }
 
-function main() {
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+async function main() {
   const args = parseArgs(process.argv);
   const url = args.url || "https://en.wikipedia.org/wiki/Web_scraping";
 
@@ -145,29 +191,68 @@ function main() {
  MarkSnip dev mode
  -----------------
  browser : ${args.browser}
- source  : ${path.relative(process.cwd(), SRC_DIR)}
  build   : ${path.relative(process.cwd(), path.join(BUILD_ROOT, args.browser))}
  start   : ${url}
 
- Saving any source file rebuilds the extension and reloads it.
- Ctrl+C stops web-ext and this watcher.
+ Save any source file -> rebuild -> reload.
+ Ctrl+C to stop.
 `
   );
 
+  // Initial build
   rebuild(args.browser);
-  const child = spawnWebExt(args.browser, url, args.forwarded, args.verbose);
-  const watcher = watchSrc((filename) => {
-    log("change ", filename);
-    rebuild(args.browser);
-  });
 
-  const shutdown = (sig) => {
+  let watcher;
+  let shutdownFns = [];
+
+  if (args.browser === "chrome") {
+    const targetDir = path.join(BUILD_ROOT, "chrome");
+    log("chrome ", "launching browser...");
+    let session = await launchChrome(targetDir, url);
+    log("chrome ", `extension loaded (id: ${session.extensionId})`);
+
+    let reloading = false;
+    watcher = watchSrc(async (filename) => {
+      if (reloading) return;
+      reloading = true;
+      log("change ", filename);
+      rebuild("chrome");
+      log("reload ", "restarting browser with fresh build...");
+      session = await reloadChrome(targetDir, url, session.context);
+      log("reload ", `done (id: ${session.extensionId})`);
+      reloading = false;
+    });
+
+    shutdownFns.push(async () => {
+      await session.context.close().catch(() => {});
+    });
+  } else {
+    const targetDir = path.join(BUILD_ROOT, "firefox");
+    const ff = startFirefox(targetDir, url, args.forwarded);
+
+    watcher = watchSrc((filename) => {
+      log("change ", filename);
+      rebuild("firefox");
+      ff.afterRebuild();
+    });
+
+    shutdownFns.push(() => {
+      if (!ff.child.killed) ff.child.kill("SIGTERM");
+    });
+  }
+
+  const shutdown = async (sig) => {
     log("dev    ", `${sig} received, shutting down`);
     watcher.close();
-    if (!child.killed) child.kill(sig);
+    for (const fn of shutdownFns) await fn();
+    process.exit(0);
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
-main();
+main().catch((err) => {
+  log("dev    ", `fatal: ${err.message}`);
+  console.error(err.stack);
+  process.exit(1);
+});
